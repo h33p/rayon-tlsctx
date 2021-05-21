@@ -156,7 +156,7 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
     /// // What matters is that the final sum matches the expected value.
     /// assert_eq!(ctx.into_iter().sum::<usize>(), buf_sum * NUM_COPIES);
     /// ```
-    pub unsafe fn get<'a>(&'a self) -> ThreadLocalMut<'a, T, F> {
+    pub unsafe fn get(&self) -> ThreadLocalMut<T, F> {
         if self.cloned.get().is_null() {
             let mut data = self.init_mutex.lock().unwrap();
             if self.cloned.get().is_null() {
@@ -194,11 +194,13 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
     }
 }
 
+type VecIter<T> = std::vec::IntoIter<(Option<T>, bool)>;
+type FmapFn<T> = fn((Option<T>, bool)) -> Option<T>;
+
 /// Consume the context and retrieve all created items.
 impl<T, F> IntoIterator for ThreadLocalCtx<T, F> {
     type Item = T;
-    type IntoIter =
-        FilterMap<std::vec::IntoIter<(Option<T>, bool)>, fn((Option<T>, bool)) -> Option<T>>;
+    type IntoIter = FilterMap<VecIter<T>, FmapFn<T>>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.init_mutex
