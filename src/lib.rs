@@ -124,8 +124,7 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
     ///
     /// # Panics
     ///
-    /// If called from outside of a Rayon thread pool, or when the reference is already being
-    /// borrowed.
+    /// When the reference is already being borrowed.
     ///
     /// # Examples
     ///
@@ -160,7 +159,7 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
         if self.cloned.get().is_null() {
             let mut data = self.init_mutex.lock().unwrap();
             if self.cloned.get().is_null() {
-                *data = (0..rayon::current_num_threads())
+                *data = (0..=rayon::current_num_threads())
                     .map(|_| (None, false))
                     .collect();
 
@@ -168,7 +167,7 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
             }
         }
 
-        let tid = rayon::current_thread_index().unwrap();
+        let tid = rayon::current_thread_index().map(|i| i + 1).unwrap_or(0);
 
         match &mut *self.cloned.get().add(tid) {
             (_, true) => panic!("Already borrowed the value on thread {}!", tid),
