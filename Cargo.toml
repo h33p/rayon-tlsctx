@@ -1,6 +1,6 @@
 [package]
 name = "rayon-tlsctx"
-version = "0.1.2"
+version = "0.2.0"
 authors = ["Aurimas Blažulionis <0x60@pm.me>"]
 edition = "2018"
 description = "thread local contexts for rayon loops"

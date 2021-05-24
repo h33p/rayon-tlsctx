@@ -1,10 +1,9 @@
 # rayon-tlsctx
 
 [![Crates.io](https://img.shields.io/crates/v/rayon-tlsctx.svg)](https://crates.io/crates/rayon-tlsctx)
+[![API Docs](https://docs.rs/rayon-tlsctx/badge.svg)](https://docs.rs/rayon-tlsctx)
 [![Build and test](https://github.com/h33p/rayon-tlsctx/actions/workflows/build.yml/badge.svg)](https://github.com/h33p/rayon-tlsctx/actions/workflows/build.yml)
 [![MIT licensed](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-
-[API Docs](https://docs.rs/rayon-tlsctx)
 
 ## Thread local variables for Rayon thread pools
 

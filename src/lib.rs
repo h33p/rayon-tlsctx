@@ -1,8 +1,11 @@
 //! # Clone only when it's necessary
 //!
-//! This library provides an efficient way to clone values in a rayon thread pool, but only once
-//! per thread. It cuts down on computation time for potentially expensive cloning operations.
+//! This library provides an efficient way to clone values in a rayon thread pool, but usually
+//! just once per thread. It cuts down on computation time for potentially expensive cloning
+//! operations.
 //!
+//! Additional clones can rarely occur when rayon schedules execution of another instance of the
+//! same job, recursively. But in the end, there should not be more than 2N clones, for N threads.
 //!
 //! # Examples
 //!
@@ -47,7 +50,6 @@
 //! ```
 
 use std::cell::Cell;
-use std::iter::FilterMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::Mutex;
 
@@ -56,8 +58,8 @@ use std::sync::Mutex;
 /// This context can be used to efficiently clone `inner`, only when it's necessary.
 pub struct ThreadLocalCtx<T, F> {
     inner: F,
-    init_mutex: Mutex<Vec<(Option<T>, bool)>>,
-    cloned: Cell<*mut (Option<T>, bool)>,
+    init_mutex: Mutex<Vec<ThreadLocalNode<T>>>,
+    cloned: Cell<*mut ThreadLocalNode<T>>,
 }
 
 unsafe impl<T, F: Send + Sync> Sync for ThreadLocalCtx<T, F> {}
@@ -117,14 +119,15 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
 
     /// Get a thread local context reference with dynamically checked borrow rules
     ///
+    /// # Remarks
+    ///
+    /// It is advised to manually drop the borrowed context if it is to be reborrowed within inner scope.
+    /// This is because chances of heap allocations significantly increase.
+    ///
     /// # Safety
     ///
-    /// Only one thread pool at a given time should use this scope. The thread pool size can not
-    /// grow midway through.
-    ///
-    /// # Panics
-    ///
-    /// When the reference is already being borrowed.
+    /// Only one thread pool should use this scope (throughout the duration of its lifetime). The thread
+    /// pool size can not grow midway through.
     ///
     /// # Examples
     ///
@@ -155,12 +158,12 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
     /// // What matters is that the final sum matches the expected value.
     /// assert_eq!(ctx.into_iter().sum::<usize>(), buf_sum * NUM_COPIES);
     /// ```
-    pub unsafe fn get(&self) -> ThreadLocalMut<T, F> {
+    pub unsafe fn get(&self) -> ThreadLocalMut<T> {
         if self.cloned.get().is_null() {
             let mut data = self.init_mutex.lock().unwrap();
             if self.cloned.get().is_null() {
                 *data = (0..=rayon::current_num_threads())
-                    .map(|_| (None, false))
+                    .map(|_| Default::default())
                     .collect();
 
                 self.cloned.set(data.as_mut_ptr());
@@ -169,44 +172,112 @@ impl<T, F: Fn() -> T> ThreadLocalCtx<T, F> {
 
         let tid = rayon::current_thread_index().map(|i| i + 1).unwrap_or(0);
 
-        match &mut *self.cloned.get().add(tid) {
-            (_, true) => panic!("Already borrowed the value on thread {}!", tid),
-            (Some(val), b) => {
-                *b = true;
+        let freenode = (*self.cloned.get().add(tid)).get_free_node();
+
+        match freenode {
+            ThreadLocalNode {
+                value: _,
+                borrowed: true,
+                next_box: _,
+            } => panic!("Already borrowed the value on thread {}!", tid),
+            ThreadLocalNode {
+                value: Some(val),
+                borrowed,
+                next_box: _,
+            } => {
+                *borrowed = true;
                 ThreadLocalMut {
                     val,
-                    parent: self,
-                    tid,
+                    parent: borrowed,
                 }
             }
-            (val, b) => {
-                *b = true;
+            ThreadLocalNode {
+                value,
+                borrowed,
+                next_box: _,
+            } => {
+                *borrowed = true;
                 let cloned = (self.inner)();
-                *val = Some(cloned);
+                *value = Some(cloned);
                 ThreadLocalMut {
-                    val: val.as_mut().unwrap(),
-                    parent: self,
-                    tid,
+                    val: value.as_mut().unwrap(),
+                    parent: borrowed,
                 }
             }
         }
     }
 }
 
-type VecIter<T> = std::vec::IntoIter<(Option<T>, bool)>;
-type FmapFn<T> = fn((Option<T>, bool)) -> Option<T>;
+/// Thread local node, can have children if there is some work stealing happening.
+struct ThreadLocalNode<T> {
+    value: Option<T>,
+    borrowed: bool,
+    next_box: Option<Box<ThreadLocalNode<T>>>,
+}
 
+impl<T> Default for ThreadLocalNode<T> {
+    fn default() -> Self {
+        Self {
+            value: None,
+            borrowed: false,
+            next_box: None,
+        }
+    }
+}
+
+impl<T> ThreadLocalNode<T> {
+    fn get_free_node(&mut self) -> &mut Self {
+        if !self.borrowed {
+            self
+        } else {
+            match &mut self.next_box {
+                Some(next) => next.get_free_node(),
+                x => {
+                    *x = Some(Default::default());
+                    x.as_mut().unwrap()
+                }
+            }
+        }
+    }
+}
+
+/// Final iterator for ThreadLocalCtx.
+pub struct ThreadNodeIterator<T> {
+    nodes: std::vec::IntoIter<ThreadLocalNode<T>>,
+    cur: Option<ThreadLocalNode<T>>,
+}
+
+impl<T> Iterator for ThreadNodeIterator<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.cur.is_none() {
+            self.cur = self.nodes.next();
+        }
+
+        if let Some(cur) = self.cur.take() {
+            let next = cur.next_box;
+            self.cur = next.map(|i| *i);
+            if let Some(v) = cur.value {
+                Some(v)
+            } else {
+                self.next()
+            }
+        } else {
+            None
+        }
+    }
+}
 /// Consume the context and retrieve all created items.
 impl<T, F> IntoIterator for ThreadLocalCtx<T, F> {
     type Item = T;
-    type IntoIter = FilterMap<VecIter<T>, FmapFn<T>>;
+    type IntoIter = ThreadNodeIterator<T>;
 
     fn into_iter(self) -> Self::IntoIter {
-        self.init_mutex
-            .into_inner()
-            .unwrap()
-            .into_iter()
-            .filter_map(|(i, _)| i)
+        ThreadNodeIterator {
+            nodes: self.init_mutex.into_inner().unwrap().into_iter(),
+            cur: None,
+        }
     }
 }
 
@@ -214,13 +285,12 @@ impl<T, F> IntoIterator for ThreadLocalCtx<T, F> {
 ///
 /// This structure tracks borrow rules at runtime, it may be necessary to manually
 /// drop the object, if multiple rayon loops are involved.
-pub struct ThreadLocalMut<'a, T, F> {
+pub struct ThreadLocalMut<'a, T> {
     val: &'a mut T,
-    parent: &'a ThreadLocalCtx<T, F>,
-    tid: usize,
+    parent: &'a mut bool,
 }
 
-impl<'a, T, F> Deref for ThreadLocalMut<'a, T, F> {
+impl<'a, T> Deref for ThreadLocalMut<'a, T> {
     type Target = T;
 
     fn deref(&self) -> &T {
@@ -228,16 +298,14 @@ impl<'a, T, F> Deref for ThreadLocalMut<'a, T, F> {
     }
 }
 
-impl<'a, T, F> DerefMut for ThreadLocalMut<'a, T, F> {
+impl<'a, T> DerefMut for ThreadLocalMut<'a, T> {
     fn deref_mut(&mut self) -> &mut T {
         self.val
     }
 }
 
-impl<'a, T, F> Drop for ThreadLocalMut<'a, T, F> {
+impl<'a, T> Drop for ThreadLocalMut<'a, T> {
     fn drop(&mut self) {
-        unsafe {
-            (*self.parent.cloned.get().add(self.tid)).1 = false;
-        }
+        *self.parent = false;
     }
 }
